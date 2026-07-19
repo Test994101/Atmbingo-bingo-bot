@@ -14,7 +14,7 @@ STATE = {
     "running": False,
 }
 
-TOKEN = os.environ.get("BINGO_TOKEN") or "copy your token here"
+TOKEN = os.environ.get("BINGO_TOKEN") or "PUT_YOUR_TOKEN_HERE"
 
 def generate_card() -> List[List[int]]:
     # Standard 5x5 Bingo (B:1-15, I:16-30, N:31-45, G:46-60, O:61-75)
