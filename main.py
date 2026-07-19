@@ -18,6 +18,7 @@ STATE = {
     "draw_pool": list(range(1, 76)),
     "running": False,
     "lobby": {"chat_id": None, "message_id": None},
+    "auto_draw": {"enabled": False, "interval": 30, "task": None},
 }
 
 TOKEN = os.environ.get("BINGO_TOKEN") or "PUT_YOUR_TOKEN_HERE"
@@ -82,10 +83,14 @@ def check_bingo(rows: List[List[int]], marks: Set[int]) -> bool:
 def build_lobby_text() -> str:
     n_players = len(STATE["players"])
     status = "running" if STATE["running"] else "idle"
-    return f"ATM Bingo — players: {n_players} | status: {status}"
+    ad = STATE["auto_draw"]
+    ad_status = f"on ({ad['interval']}s)" if ad["enabled"] else "off"
+    return f"ATM Bingo — players: {n_players} | status: {status} | auto-draw: {ad_status}"
 
 
 def build_lobby_keyboard() -> InlineKeyboardMarkup:
+    ad = STATE["auto_draw"]
+    ad_label = "Auto: On" if ad["enabled"] else "Auto: Off"
     kb = [
         [
             InlineKeyboardButton("Join", callback_data="join"),
@@ -96,6 +101,9 @@ def build_lobby_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("Start Game", callback_data="start"),
             InlineKeyboardButton("Draw", callback_data="draw"),
             InlineKeyboardButton("Called", callback_data="called"),
+        ],
+        [
+            InlineKeyboardButton(ad_label, callback_data="autotoggle"),
         ],
     ]
     return InlineKeyboardMarkup(kb)
@@ -183,6 +191,9 @@ async def startgame_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     random.shuffle(STATE["draw_pool"])
     await update.message.reply_text("Game started! Use Draw to draw numbers.")
     await post_or_update_lobby(context, update.effective_chat.id)
+    # If auto-draw is enabled, start background loop
+    if STATE["auto_draw"]["enabled"] and STATE["auto_draw"]["task"] is None:
+        STATE["auto_draw"]["task"] = asyncio.create_task(auto_draw_loop(context, update.effective_chat.id))
 
 
 async def draw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,6 +224,42 @@ async def draw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def called_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Called numbers: {sorted(STATE['called'])}")
+
+
+# --- Auto-draw implementation ---
+async def auto_draw_loop(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    try:
+        while STATE["auto_draw"]["enabled"] and STATE["running"]:
+            interval = STATE["auto_draw"]["interval"]
+            await asyncio.sleep(interval)
+            # stop if conditions changed
+            if not STATE["auto_draw"]["enabled"] or not STATE["running"]:
+                break
+            if not STATE["draw_pool"]:
+                await context.bot.send_message(chat_id=chat_id, text="Auto-draw: all numbers drawn.")
+                STATE["running"] = False
+                break
+            n = STATE["draw_pool"].pop()
+            STATE["called"].add(n)
+            winners = []
+            for uid, p in STATE["players"].items():
+                for r in p["card"]:
+                    for v in r:
+                        if v == n:
+                            p["marks"].add(n)
+                if check_bingo(p["card"], p["marks"]):
+                    winners.append(p["name"])
+            text = f"Auto-draw number: {n}\nCalled so far: {sorted(STATE['called'])}"
+            if winners:
+                text += "\nBINGO! Winner(s): " + ", ".join(winners)
+                STATE["running"] = False
+            await context.bot.send_message(chat_id=chat_id, text=text)
+            await post_or_update_lobby(context, chat_id)
+    except asyncio.CancelledError:
+        # Task cancelled (auto-draw turned off)
+        pass
+    finally:
+        STATE["auto_draw"]["task"] = None
 
 
 # --- CallbackQuery handlers for inline buttons ---
@@ -279,6 +326,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         random.shuffle(STATE["draw_pool"])
         await query.answer(text="Game started!")
         await post_or_update_lobby(context, chat_id)
+        # start auto-draw if enabled
+        if STATE["auto_draw"]["enabled"] and STATE["auto_draw"]["task"] is None:
+            STATE["auto_draw"]["task"] = asyncio.create_task(auto_draw_loop(context, chat_id))
 
     elif data == "draw":
         # admin-only
@@ -314,7 +364,101 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         await context.bot.send_message(chat_id=chat_id, text=f"Called numbers: {sorted(STATE['called'])}")
 
+    elif data == "autotoggle":
+        # admin-only toggle
+        if not await is_admin(user.id):
+            await query.answer(text="Only chat admins can toggle auto-draw.")
+            return
+        # toggle
+        STATE["auto_draw"]["enabled"] = not STATE["auto_draw"]["enabled"]
+        if STATE["auto_draw"]["enabled"]:
+            await query.answer(text=f"Auto-draw enabled ({STATE['auto_draw']['interval']}s)")
+            # start task if game running
+            if STATE["running"] and STATE["auto_draw"]["task"] is None:
+                STATE["auto_draw"]["task"] = asyncio.create_task(auto_draw_loop(context, chat_id))
+        else:
+            # disable and cancel task
+            task = STATE["auto_draw"].get("task")
+            if task:
+                task.cancel()
+            STATE["auto_draw"]["task"] = None
+            await query.answer(text="Auto-draw disabled")
+        await post_or_update_lobby(context, chat_id)
 
+
+# --- Auto-draw command handlers (admin-only for control) ---
+async def autodraw_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    # admin check
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await update.message.reply_text("Only chat admins can enable auto-draw.")
+            return
+    except Exception:
+        await update.message.reply_text("Could not verify admin status.")
+        return
+    STATE["auto_draw"]["enabled"] = True
+    await update.message.reply_text(f"Auto-draw enabled ({STATE['auto_draw']['interval']}s)")
+    # start loop if game running
+    if STATE["running"] and STATE["auto_draw"]["task"] is None:
+        STATE["auto_draw"]["task"] = asyncio.create_task(auto_draw_loop(context, chat_id))
+    await post_or_update_lobby(context, chat_id)
+
+
+async def autodraw_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await update.message.reply_text("Only chat admins can disable auto-draw.")
+            return
+    except Exception:
+        await update.message.reply_text("Could not verify admin status.")
+        return
+    STATE["auto_draw"]["enabled"] = False
+    task = STATE["auto_draw"].get("task")
+    if task:
+        task.cancel()
+    STATE["auto_draw"]["task"] = None
+    await update.message.reply_text("Auto-draw disabled")
+    await post_or_update_lobby(context, chat_id)
+
+
+async def autodraw_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ad = STATE["auto_draw"]
+    await update.message.reply_text(f"Auto-draw: {'enabled' if ad['enabled'] else 'disabled'}; interval={ad['interval']}s")
+
+
+async def autodraw_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status not in ("administrator", "creator"):
+            await update.message.reply_text("Only chat admins can set auto-draw interval.")
+            return
+    except Exception:
+        await update.message.reply_text("Could not verify admin status.")
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: /autodraw_set <seconds>")
+        return
+    try:
+        sec = int(args[0])
+        if sec < 5:
+            await update.message.reply_text("Minimum interval is 5 seconds.")
+            return
+        STATE["auto_draw"]["interval"] = sec
+        await update.message.reply_text(f"Auto-draw interval set to {sec}s")
+    except ValueError:
+        await update.message.reply_text("Please provide an integer number of seconds.")
+
+
+# --- CallbackQuery handlers and commands registration ---
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -326,6 +470,12 @@ def main():
     app.add_handler(CommandHandler("startgame", startgame_cmd))
     app.add_handler(CommandHandler("draw", draw_cmd))
     app.add_handler(CommandHandler("called", called_cmd))
+
+    # Auto-draw commands
+    app.add_handler(CommandHandler("autodraw_on", autodraw_on))
+    app.add_handler(CommandHandler("autodraw_off", autodraw_off))
+    app.add_handler(CommandHandler("autodraw_status", autodraw_status))
+    app.add_handler(CommandHandler("autodraw_set", autodraw_set))
 
     # CallbackQuery handler for inline buttons
     app.add_handler(CallbackQueryHandler(on_button))
